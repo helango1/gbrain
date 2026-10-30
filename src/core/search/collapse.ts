@@ -134,16 +134,18 @@ export interface PageFacts { target: string | null; body: string | null; bodyCha
  * the read does not return has no facts.
  */
 async function readFactRows(engine: Pick<BrainEngine, 'executeRaw'>, ids: number[], bodyIds: number[]): Promise<Map<number, PageFacts>> {
+  // The LATERAL (OFFSET 0 keeps it from being inlined) reads the body once per row: Postgres evaluates a repeated
+  // expression each time, and each evaluation detoasts the body again.
   const body = `btrim(COALESCE(${boundedBodyPrefixSql('p')}, ''))`;
   const rows = await engine.executeRaw<{ id: number; target: string | null; body: string | null; body_chars: number | null; lead: string | null }>(
     `SELECT p.id,
             COALESCE(NULLIF(btrim(p.frontmatter->>'redirect_to'), ''), NULLIF(btrim(p.frontmatter->>'redirect'), ''),
                      NULLIF(btrim(p.frontmatter->>'merged_into'), ''),
                      CASE WHEN ${STATUS_REDIRECT} THEN NULLIF(btrim(p.frontmatter->>'superseded_by'), '') END) AS target,
-            length(${body}) AS body_chars,
-            CASE WHEN p.id = ANY($2::int[]) AND length(${body}) >= ${IDENTICAL_BODY_MIN_CHARS} THEN md5(${body}) END AS body,
-            CASE WHEN p.id = ANY($2::int[]) THEN left(${body}, ${OVERLAP_PREFIX_CHARS}) END AS lead
-       FROM pages p WHERE p.id = ANY($1::int[])`,
+            length(b.body) AS body_chars,
+            CASE WHEN p.id = ANY($2::int[]) AND length(b.body) >= ${IDENTICAL_BODY_MIN_CHARS} THEN md5(b.body) END AS body,
+            CASE WHEN p.id = ANY($2::int[]) THEN left(b.body, ${OVERLAP_PREFIX_CHARS}) END AS lead
+       FROM pages p CROSS JOIN LATERAL (SELECT ${body} AS body OFFSET 0) b WHERE p.id = ANY($1::int[])`,
     [ids, bodyIds],
   );
   const facts = new Map<number, PageFacts>(ids.map(id => [id, { target: null, body: null, bodyChars: null, words: null }]));

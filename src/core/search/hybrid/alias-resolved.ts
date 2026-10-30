@@ -30,11 +30,19 @@ export async function readAliasCanonicals(
   let rows: Array<{ source_id: string; canonical_slug: string }> = [];
   try {
     rows = await engine.executeRaw<{ source_id: string; canonical_slug: string }>(
-      `SELECT DISTINCT a.source_id, a.canonical_slug
-       FROM slug_aliases a JOIN pages p ON p.source_id = a.source_id AND p.slug = a.canonical_slug
-       WHERE (a.source_id, a.canonical_slug) IN (
-         SELECT * FROM unnest($1::text[], $2::text[])
-       ) AND ${filter}`,
+      // MATERIALIZED probes slug_aliases first. Inlined, the planner joins every ref to pages (and the read filter)
+      // before it looks at slug_aliases, which is usually empty for these refs. (source_id, slug) is unique in
+      // pages, so the join keeps the rows distinct.
+      `WITH canonical AS MATERIALIZED (
+         SELECT DISTINCT a.source_id, a.canonical_slug
+         FROM slug_aliases a
+         WHERE (a.source_id, a.canonical_slug) IN (
+           SELECT * FROM unnest($1::text[], $2::text[])
+         )
+       )
+       SELECT a.source_id, a.canonical_slug
+       FROM canonical a JOIN pages p ON p.source_id = a.source_id AND p.slug = a.canonical_slug
+       WHERE ${filter}`,
       params,
     );
   } catch {
