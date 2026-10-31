@@ -94,6 +94,9 @@ export const unchanged = (col: string) => `(age(${col}) > x.lo_age OR COALESCE(a
 /**
  * One scan of the source's pages and one of the incarnation's op rows: the counts, and the rows S1 does not prove unchanged.
  * `$6`: the request publishing in this transaction (a folded checkpoint, sync-pass-fold.ts), whose page is not committed yet.
+ * An op row's changed entry is built before the sort that groups the rows (`OFFSET 0` keeps the planner from moving it
+ * back into the aggregate), so the sort carries the op and a NULL for an unchanged row, not the whole row: grouped
+ * whole, 10k import records spilled the sort to disk (about 15 ms against 9 ms).
  */
 const PROOF = `WITH x AS MATERIALIZED (SELECT txid_snapshot_xmin(txid_current_snapshot()) AS now_lo, txid_snapshot_xmax(txid_current_snapshot()) AS hi,
     ${loAge('$4::bigint')} AS lo_age, txid_current_snapshot()::text AS now_snapshot, txid_current_if_assigned()::text AS now_own),
@@ -104,9 +107,9 @@ const PROOF = `WITH x AS MATERIALIZED (SELECT txid_snapshot_xmin(txid_current_sn
         AND (r.id=$6::uuid OR r.state='committed' AND r.intent->>'passId'=$5 AND r.outcome->>'revision'=p.knowledge_revision::text)), p.knowledge_revision::text))
         FILTER (WHERE NOT ${unchanged('p.xmin')}), '[]'::jsonb) AS changed
     FROM pages p, x, s1 WHERE p.source_id=$1),
-  oc AS (SELECT o.op, count(*)::int AS n, jsonb_agg(jsonb_build_array(o.op, o.fingerprint, o.completed_keys->0->>'revision', o.completed_keys->0->>'run_id'))
-        FILTER (WHERE NOT ${unchanged('o.xmin')}) AS changed
-    FROM op_checkpoints o, x, s1 WHERE ${opScope('o.', '$2', '$3')} GROUP BY o.op)
+  oc AS (SELECT o.op, count(*)::int AS n, jsonb_agg(o.changed) FILTER (WHERE o.changed IS NOT NULL) AS changed
+    FROM (SELECT o.op, CASE WHEN NOT ${unchanged('o.xmin')} THEN jsonb_build_array(o.op, o.fingerprint, o.completed_keys->0->>'revision', o.completed_keys->0->>'run_id') END AS changed
+      FROM op_checkpoints o, x, s1 WHERE ${opScope('o.', '$2', '$3')} OFFSET 0) o GROUP BY o.op)
   SELECT x.now_lo::text AS xmin, x.now_snapshot AS snapshot, x.now_own AS own, (x.hi - $4::bigint)::float8 AS span, pg.n AS pages, pg.changed AS pages_changed,
     (SELECT COALESCE(jsonb_object_agg(op, n), '{}'::jsonb) FROM oc) AS ops,
     (SELECT COALESCE(jsonb_agg(c), '[]'::jsonb) FROM oc, jsonb_array_elements(COALESCE(oc.changed, '[]'::jsonb)) c) AS ops_changed,

@@ -10,6 +10,31 @@ credits are retained; no result has been reassigned to another provider. Origina
 identifiers and attribution are available in the pre-removal Git revision
 `6040075c6cb95be5881cc2e1b76ef7d71f4e5d29` (retained on 2026-09-23).
 
+## [0.60.496.0] - 2026-10-30
+
+**A commit on a large managed brain shows up in search a few milliseconds sooner, and the sync's publish step stops writing a temporary file to disk.**
+
+Each managed sync job checks twice that nothing moved under it before it publishes the new pages: once before the install and once inside the install transaction, while it holds its locks. On a brain with about 10,000 pages, that check sorted every page's full import record, and the sort was too big for memory, so Postgres spilled about 7.5 MB to a temporary file on each check. The check now sorts only what it needs and builds the record for a page that changed only when it changed. The sort stays in memory, and each check takes about 9 ms instead of about 15 ms.
+
+### The numbers that matter
+
+Interleaved A/B, Postgres managed brain, 10,000 pages, one-file commit, a 200 ms keyless embedding stub, 10 runs per arm of 23 counted reps, 16-CPU machine:
+
+| Measured from the first serve log line | Before (p50) | After (p50) | Change | Runs where after was faster |
+|---|---|---|---|---|
+| Keyword search finds the commit | 162.0 ms | 156.2 ms | -5.8 ms (95% CI -7.7 to -3.4) | 10 of 10 |
+| Every changed chunk has a vector | 417.2 ms | 414.7 ms | -2.5 ms (95% CI -5.8 to 0.3) | 8 of 10 |
+
+Search results, keyword visibility, embedding coverage, CPU and memory did not change.
+
+### Things to watch
+
+Nothing to do after upgrading. There is no schema change, no new setting and no change to what the check accepts or refuses.
+
+### Itemized changes
+
+- `src/core/persistence/sync-pass-confirm.ts`: the confirm proof builds each op row's changed entry before the sort that groups the rows (`OFFSET 0` keeps the planner from moving it back into the aggregate), so the sort carries the op and a NULL for an unchanged row instead of the whole row.
+
 ## [0.60.495.0] - 2026-10-29
 
 **Every harness install now tells the agent to check gbrain first, and the rule rides each turn, not just the system prompt.**
