@@ -10,6 +10,19 @@ credits are retained; no result has been reassigned to another provider. Origina
 identifiers and attribution are available in the pre-removal Git revision
 `6040075c6cb95be5881cc2e1b76ef7d71f4e5d29` (retained on 2026-09-23).
 
+## [0.60.496.0] - 2026-10-30
+
+**Warm hybrid search is faster: the collapse prefetch reads each page body once, and alias resolution probes `slug_aliases` before `pages`.**
+
+Two post-fusion SQL statements did more work than they needed on every warm `search` call. The collapse prefetch (`readFactRows`) repeated the bounded body expression four times per row, and Postgres has no common-subexpression elimination, so a TOASTed body was detoasted up to four times. The alias read (`readAliasCanonicals`) let the planner merge-join `pages` against the unnested key list before it looked at `slug_aliases`, which is empty or small on most brains. The prefetch now computes the body once in a `LATERAL ... OFFSET 0` subquery, and the alias read probes `slug_aliases` first in a `MATERIALIZED` CTE and joins `pages` on its unique `(source_id, slug)` key. Results, ranking, filters, schema and limits are unchanged.
+
+On a synthetic brain (warm `gbrain serve`, interleaved A/B, 6 rounds of 60 calls each), Postgres p50 went from 63.8 to 57.2 ms and p95 from 80.3 to 69.2 ms; PGLite p50 went from 120.1 to 112.4 ms and p95 from 194.8 to 189.4 ms. Every round was faster on both engines, and the ordered top-k was identical on all 360 calls per engine.
+
+### Itemized changes
+
+- `src/core/search/collapse.ts`: `readFactRows` evaluates the bounded, trimmed body once per row (`CROSS JOIN LATERAL (SELECT ... AS body OFFSET 0)`); `length`, `md5` and `left` read that column.
+- `src/core/search/hybrid/alias-resolved.ts`: `readAliasCanonicals` reads the matching `slug_aliases` rows in a `MATERIALIZED` CTE, then joins `pages` with the same `pageReadFilter` as before.
+
 ## [0.60.495.0] - 2026-10-29
 
 **Every harness install now tells the agent to check gbrain first, and the rule rides each turn, not just the system prompt.**
