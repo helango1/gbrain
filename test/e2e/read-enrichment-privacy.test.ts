@@ -10,6 +10,7 @@ import { configureGateway, resetGateway } from '../../src/core/ai/gateway.ts';
 import { findExperts } from '../../src/commands/whoknows.ts';
 import { applySupersedeDownrank, runPostFusionStages, _resetSupersedeProbeForTests } from '../../src/core/search/hybrid.ts';
 import { applyGraphSignals } from '../../src/core/search/graph-signals.ts';
+import { readAliasCanonicals } from '../../src/core/search/hybrid/alias-resolved.ts';
 import { buildRelationalArm } from '../../src/core/search/relational-recall.ts';
 import { TAKES_FENCE_BEGIN, TAKES_FENCE_END } from '../../src/core/takes-fence.ts';
 import { readBacklinkCounts, type ReadQuery } from '../../src/core/search/read-enrichment.ts';
@@ -213,6 +214,44 @@ for (const kind of ['pglite', 'postgres'] as const) {
       const local = [result('notes/local-control', ids[5])];
       await applySupersedeDownrank(local, engine);
       expect(local[0].superseded_by).toBe('notes/new-hidden-origin');
+    });
+
+    test('alias canonicals hide private, deleted, quarantined, foreign and archived-source pages', async () => {
+      const variants = ['allowed', 'cross-source', 'hidden', 'foreign', 'archived', 'deleted', 'quarantined'] as const;
+      const sourceOf = (v: string) => v === 'cross-source' ? B : v === 'foreign' ? FOREIGN : v === 'archived' ? ARCHIVED : A;
+      const refs = [...variants.map(v => ref(`notes/canonical-${v}`, sourceOf(v))), ref('notes/no-alias')];
+      await engine.executeRaw('DELETE FROM slug_aliases WHERE source_id = ANY($1::text[])', [SOURCES]);
+      try {
+        const ids: Record<string, number> = {};
+        for (const v of variants) {
+          ids[v] = await page(`notes/canonical-${v}`, sourceOf(v),
+            v === 'hidden' ? { visibility: 'private' } : v === 'quarantined' ? { quarantine: { reason: 'fixture' } } : {});
+          await engine.executeRaw('INSERT INTO slug_aliases (source_id, alias_slug, canonical_slug) VALUES ($1, $2, $3)',
+            [sourceOf(v), `notes/old-${v}`, `notes/canonical-${v}`]);
+        }
+        await page('notes/no-alias');
+        await engine.executeRaw('UPDATE pages SET deleted_at = now() WHERE id = $1', [ids.deleted]);
+        await engine.executeRaw('UPDATE sources SET archived = TRUE WHERE id = $1', [ARCHIVED]);
+        const sorted = (s: Set<string>) => [...s].sort();
+
+        expect(sorted(await readAliasCanonicals(engine, refs, policy)))
+          .toEqual([key('notes/canonical-allowed'), key('notes/canonical-cross-source', B)]);
+        // A source-only policy still drops deleted, quarantined and archived-source pages, but not private ones.
+        expect(sorted(await readAliasCanonicals(engine, refs, { sourceIds: [A, B, ARCHIVED] })))
+          .toEqual([key('notes/canonical-allowed'), key('notes/canonical-hidden'), key('notes/canonical-cross-source', B)]);
+        // Trusted local control: no policy, no read filter.
+        expect((await readAliasCanonicals(engine, refs)).size).toBe(variants.length);
+
+        const rows = refs.map(r => result(r.slug, ids[r.slug.replace('notes/canonical-', '')] ?? 0, r.source_id));
+        await runPostFusionStages(engine, rows, { applyBacklinks: false, salience: 'off', recency: 'off', ...policy });
+        expect(rows.filter(r => r.alias_resolved_boost !== undefined).map(r => r.slug))
+          .toEqual(['notes/canonical-allowed', 'notes/canonical-cross-source']);
+
+        await engine.executeRaw("UPDATE pages SET frontmatter = frontmatter || '{\"visibility\":\"private\"}'::jsonb WHERE id = $1", [ids.allowed]);
+        expect(sorted(await readAliasCanonicals(engine, refs, policy))).toEqual([key('notes/canonical-cross-source', B)]);
+      } finally {
+        await engine.executeRaw('DELETE FROM slug_aliases WHERE source_id = ANY($1::text[])', [SOURCES]);
+      }
     });
 
     test('stale candidate IDs and same-slug refs cannot read flags, extraction state or dates after revocation', async () => {
