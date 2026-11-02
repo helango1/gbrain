@@ -42,13 +42,13 @@ export function watchTargets(gitDir: string, commonDir: string | null): string[]
   return [...new Set(dirs)].filter(dir => existsSync(dir));
 }
 
-export type WatchFn = (dirs: string[], onChange: () => void) => (() => void) | null;
+export type WatchFn = (dirs: string[], onChange: (dir: string, file: string | null) => void) => (() => void) | null;
 
 export const watchGitDirs: WatchFn = (dirs, onChange) => {
   const closers: Array<() => void> = [];
   for (const dir of dirs) {
     try {
-      const w = fsWatch(dir, { persistent: false }, () => onChange());
+      const w = fsWatch(dir, { persistent: false }, (_event, file) => onChange(dir, file == null ? null : String(file)));
       w.on('error', () => { try { w.close(); } catch { /* already closed */ } });
       closers.push(() => w.close());
     } catch { /* this directory stays poll-only */ }

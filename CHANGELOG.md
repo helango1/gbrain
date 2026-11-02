@@ -10,6 +10,20 @@ credits are retained; no result has been reassigned to another provider. Origina
 identifiers and attribution are available in the pre-removal Git revision
 `6040075c6cb95be5881cc2e1b76ef7d71f4e5d29` (retained on 2026-09-23).
 
+## [0.60.497.0] - 2026-11-02
+
+**A commit now reaches the commit notifier at once, not 250 ms later.**
+
+The notifier watches the git dirs and used to wait 250 ms after every watch event before it read HEAD. A new non-`.lock` file under `refs/heads` is the branch ref that a commit renames into place, so that one event now reads HEAD at once. Every other event (`index.lock`, any `.lock` file, `HEAD`, `packed-refs`) keeps the 250 ms wait. A checkout that is still busy (`index.lock` present) defers in the tick as before, and the next watch event re-arms the 250 ms wait, so no commit is lost. No default changes: the 3 s poll, the 400 ms quiet window and the 250 ms wait for other events stay the same.
+
+On a stub-embed sync-freshness A/B (Postgres, managed source, 10,000 pages, serve trigger), commit-to-keyword-visible p50 went from about 441 ms to about 203 ms, and commit-to-vector-searchable p50 from about 714 ms to about 470 ms.
+
+### Itemized changes
+
+- `src/core/commit-notifier.ts`: `isCommitRefEvent(dir, file)` names the commit ref event; the watch callback passes the event's directory and file name, and that event nudges with 0 ms in place of `NUDGE_MS`. A shorter nudge replaces a pending longer one; a longer nudge never delays a pending shorter one.
+- `src/core/notifier/detect.ts`: `watchGitDirs` passes the watched directory and the file name to its callback.
+- `test/commit-notifier-ref-wakeup.test.ts` (new): the immediate tick on a `refs/heads` ref, the 250 ms wait for other events, and the busy-checkout fallback.
+
 ## [0.60.495.0] - 2026-10-29
 
 **Every harness install now tells the agent to check gbrain first, and the rule rides each turn, not just the system prompt.**
