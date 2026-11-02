@@ -14,11 +14,13 @@
  * `sync.on_commit.sources` (the exclusion list); wanted markers (sync trigger, webhook, busy delegated syncs) are
  * drained regardless of the flag. It never pulls on its own: a commit-triggered run imports the checkout's HEAD.
  *
- * Detection: fs.watch on the git dirs (notifier/detect.ts) brings the next poll forward; the async rev-parse poll every
- * `GBRAIN_NOTIFIER_POLL_MS` (alias GBRAIN_SERVE_HEAD_POLL_MS, default 3 s) is the source of truth; a source whose dirs
- * cannot be watched runs in poll mode, and the mode is reported. Start rule: leading edge when the checkout is quiet
- * (no rebase/merge/cherry-pick state, no index.lock), then a trailing window `GBRAIN_NOTIFIER_QUIET_MS` (alias
- * GBRAIN_SERVE_HEAD_DEBOUNCE_MS, default 400 ms) before the next start of the same source.
+ * Detection: fs.watch on the git dirs (notifier/detect.ts) brings the next poll forward: at once for a new non-.lock
+ * file under refs/heads (the branch ref a commit renames into place), 250 ms later for any other event. The async
+ * rev-parse poll every `GBRAIN_NOTIFIER_POLL_MS` (alias GBRAIN_SERVE_HEAD_POLL_MS, default 3 s) is the source of truth;
+ * a source whose dirs cannot be watched runs in poll mode, and the mode is reported. Start rule: leading edge when the
+ * checkout is quiet (no rebase/merge/cherry-pick state, no index.lock), then a trailing window
+ * `GBRAIN_NOTIFIER_QUIET_MS` (alias GBRAIN_SERVE_HEAD_DEBOUNCE_MS, default 400 ms) before the next start of the same
+ * source.
  *
  * Scheduling: per-source single flight, a host cap (1 on PGLite; the in-process runner is one job at a time), and fair
  * order (the source started least recently goes first), so a long or blocked source never starves another. Durable
@@ -114,7 +116,7 @@ export interface CommitNotifierOptions {
   drainHeld?: (sourceId: string) => Promise<boolean | 'stalled'>;
   startSync: (sourceId: string, req: StartRequest) => Promise<StartResult>;
   jobStatus: (jobId: string) => JobStatus | null;
-  watch?: (source: NotifierSource, onChange: () => void) => (() => void) | null;
+  watch?: (source: NotifierSource, onChange: (dir?: string, file?: string | null) => void) => (() => void) | null;
   trace?: (sourceId: string, event: Record<string, unknown>) => string | null;
 }
 
@@ -301,6 +303,15 @@ async function readOwedMarkers(opts: CommitNotifierOptions, guard: ReturnType<ty
     && !(m.intent === 'pull' && rt.kind === 'managed'));
 }
 
+/**
+ * A new non-.lock file under refs/heads is a branch ref renamed into place, the last step of a commit, so the watch
+ * reads HEAD at once; every other event (index.lock, a .lock file, HEAD, packed-refs) waits NUDGE_MS. A busy
+ * checkout still defers in the tick.
+ */
+export function isCommitRefEvent(dir?: string, file?: string | null): boolean {
+  return !!dir && !!file && /[\\/]refs[\\/]heads$/.test(dir) && !file.endsWith('.lock');
+}
+
 export function startCommitNotifier(opts: CommitNotifierOptions): CommitNotifier {
   const { pollMs, quietMs, heartbeatMs, leaseMs, cap, now, pid, ownerId, forcePoll, setTimer, clearTimer, log, logOnce, forgetLog, guard, decisions, decide } = notifierKit(opts);
 
@@ -333,11 +344,11 @@ export function startCommitNotifier(opts: CommitNotifierOptions): CommitNotifier
     fireAt = at;
     fireTimer = setTimer(() => { fireTimer = null; fireAt = Infinity; void tick(); }, ms + 20);
   };
-  const nudge = () => {
+  const nudge = (ms = NUDGE_MS) => {
     if (stopped) return;
     nudged = true;
-    if (nudgeTimer !== null) return;
-    nudgeTimer = setTimer(() => { nudgeTimer = null; void tick(); }, NUDGE_MS);
+    if (nudgeTimer !== null) { if (ms >= NUDGE_MS) return; clearTimer(nudgeTimer); }
+    nudgeTimer = setTimer(() => { nudgeTimer = null; void tick(); }, ms);
   };
   const closeAllWatches = () => { for (const rt of sources.values()) closeWatch(rt); };
 
@@ -369,7 +380,7 @@ export function startCommitNotifier(opts: CommitNotifierOptions): CommitNotifier
       if (stopped) return;
       if (!rt.watched || forcePoll || !opts.watch) { if (!rt.watched) closeWatch(rt); continue; }
       if (rt.watchClose) continue;
-      const close = await guard(`watching ${rt.root}`, async () => opts.watch!(rt, nudge), null);
+      const close = await guard(`watching ${rt.root}`, async () => opts.watch!(rt, (dir, file) => nudge(isCommitRefEvent(dir, file) ? 0 : NUDGE_MS)), null);
       if (close && stopped) { try { close(); } catch { /* best effort */ } return; }
       rt.watchClose = close;
     }
@@ -576,7 +587,7 @@ export function startCommitNotifier(opts: CommitNotifierOptions): CommitNotifier
 
   const interval = (opts.setInterval ?? ((fn: () => void, ms: number) => { const h = setInterval(fn, ms); h.unref?.(); return h; }))(() => { void tick(); }, pollMs);
   return {
-    tick, nudge,
+    tick, nudge: () => nudge(),
     get enabled() { return enabled; },
     get owner() { return owner; },
     get decisions() { return decisions; },
