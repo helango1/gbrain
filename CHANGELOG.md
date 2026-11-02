@@ -10,6 +10,20 @@ credits are retained; no result has been reassigned to another provider. Origina
 identifiers and attribution are available in the pre-removal Git revision
 `6040075c6cb95be5881cc2e1b76ef7d71f4e5d29` (retained on 2026-09-23).
 
+## [0.60.497.0] - 2026-11-02
+
+**Warm hybrid search reads fewer page bodies: the collapse prefetch reads body identity only for the pages the collapse compares.**
+
+The collapse prefetch (`prefetchPageFacts`) read the bounded body, its length, hash and word set for every fused page. The collapse compares only the first 40 distinct pages, plus pages whose slug another source shares. The prefetch now reads body identity for the first 60 distinct fused pages and for every page whose slug is shared across sources. The other pages keep their frontmatter redirect and target, and the collapse reads a page's body itself if it compares one the prefetch skipped. Results, ranking, filters, schema and limits are unchanged.
+
+On a synthetic brain (warm `gbrain serve`, interleaved A/B, 6 rounds), warm p95 went from 84.9 to 79.1 ms on Postgres (5 of 6 rounds faster) and from 198.6 to 189.8 ms on PGLite (6 of 6). The ordered top-k was identical on all 360 calls per engine. The bench-hot p95 did not move beyond run spread on either engine.
+
+### Itemized changes
+
+- `src/core/search/collapse.ts`: `prefetchPageFacts` reads body identity for the first `PREFETCH_BODY_HEAD` (60) distinct fused pages and for pages whose slug is shared across sources; each prefetched entry carries `bodyRead`, and `readPageFacts` re-reads a compared page whose body the prefetch skipped.
+- `src/core/search/hybrid/rank.ts`: passes the fused rows to the prefetch.
+- `test/search/collapse-hybrid.test.ts`: pins the re-read past the window, the cross-source twin rule and the error-path fallback.
+
 ## [0.60.495.0] - 2026-10-29
 
 **Every harness install now tells the agent to check gbrain first, and the rule rides each turn, not just the system prompt.**

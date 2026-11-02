@@ -242,13 +242,13 @@ describe('GBRA-156: page facts read ahead of the collapse', () => {
 
   test('a prefetch over every page (more than the collapse reads) gives the same rows and the collapse reads no facts itself', async () => {
     await engine.setConfig('search.collapse', 'false');
-    const allIds = (await engine.executeRaw<{ id: number }>('SELECT id FROM pages')).map(r => Number(r.id));
+    const allPages = (await engine.executeRaw<{ id: number; slug: string }>('SELECT id, slug FROM pages')).map(r => ({ page_id: Number(r.id), slug: r.slug }));
     for (const q of ['zephyr ledger', 'orbit talk', 'heron memo', 'lumen sync', 'kestrel plan', 'standup badge reader', 'quill roster']) {
       const { rows } = await search(q);
       const plain: string[] = [];
       const ahead: string[] = [];
       const before = await collapseResults(recording(plain), rows.map(r => ({ ...r })), {});
-      const after = await collapseResults(recording(ahead), rows.map(r => ({ ...r })), { prefetched: prefetchPageFacts(engine, allIds) });
+      const after = await collapseResults(recording(ahead), rows.map(r => ({ ...r })), { prefetched: prefetchPageFacts(engine, allPages) });
       expect({ q, rows: after }).toEqual({ q, rows: before });
       expect({ q, reads: factReads(plain) }).toEqual({ q, reads: 1 });
       expect({ q, reads: factReads(ahead) }).toEqual({ q, reads: 0 });
@@ -260,10 +260,54 @@ describe('GBRA-156: page facts read ahead of the collapse', () => {
     const { rows } = await search('zephyr ledger');
     const expected = await collapseResults(engine, rows.map(r => ({ ...r })), {});
     const sent: string[] = [];
-    const partial = await collapseResults(recording(sent), rows.map(r => ({ ...r })), { prefetched: prefetchPageFacts(engine, [rows[0]!.page_id]) });
+    const partial = await collapseResults(recording(sent), rows.map(r => ({ ...r })), { prefetched: prefetchPageFacts(engine, [rows[0]!]) });
     expect(partial).toEqual(expected);
     expect(factReads(sent)).toBe(1);
     const failed = await collapseResults(engine, rows.map(r => ({ ...r })), { prefetched: Promise.resolve(null) });
     expect(failed).toEqual(expected);
+  });
+
+  test('a compared page past the prefetch\'s body window is read by the collapse, so identical bodies still fold', async () => {
+    await engine.setConfig('search.collapse', 'false');
+    const { rows } = await search('heron memo');
+    const expected = await collapseResults(engine, rows.map(r => ({ ...r })), {});
+    expect(expected.filter(r => r.slug.endsWith('/heron-memo'))).toHaveLength(1);
+    // 60 fused pages ahead of the pool (ids no page has) push every real page out of the window
+    const ahead = Array.from({ length: 60 }, (_, i) => ({ page_id: 900_000_000 + i, slug: `pad/page-${i}` }));
+    const sent: string[] = [];
+    const out = await collapseResults(recording(sent), rows.map(r => ({ ...r })), { prefetched: prefetchPageFacts(engine, [...ahead, ...rows]) });
+    expect(out).toEqual(expected);
+    expect(factReads(sent)).toBe(1);
+  });
+
+  test('pages whose slug another source shares get body identity from the prefetch past its window', async () => {
+    await engine.setConfig('search.collapse', 'false');
+    const { rows } = await search('zephyr ledger');
+    const twins = rows.filter(r => r.slug === 'concepts/zephyr-ledger');
+    expect(twins).toHaveLength(2);
+    const expected = await collapseResults(engine, twins.map(r => ({ ...r })), {});
+    const ahead = Array.from({ length: 60 }, (_, i) => ({ page_id: 900_000_000 + i, slug: `pad/page-${i}` }));
+    const sent: string[] = [];
+    const out = await collapseResults(recording(sent), twins.map(r => ({ ...r })), { prefetched: prefetchPageFacts(engine, [...ahead, ...twins]) });
+    expect(out).toEqual(expected);
+    expect(factReads(sent)).toBe(0);
+  });
+
+  test('when the collapse\'s own read fails, pages past the window keep the prefetch\'s frontmatter redirect', async () => {
+    await engine.setConfig('search.collapse', 'false');
+    const { rows } = await search('kestrel plan');
+    expect(row(rows, 'concepts/kestrel-plan-old')).toBeDefined();
+    const failing = new Proxy(engine, {
+      get(target, key, receiver) {
+        if (key === 'executeRaw') return (sql: string, params?: unknown[]) => sql.includes("frontmatter->>'redirect_to'") ? Promise.reject(new Error('facts read failed')) : target.executeRaw(sql, params);
+        const value = Reflect.get(target, key, receiver);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    }) as PGLiteEngine;
+    const ahead = Array.from({ length: 60 }, (_, i) => ({ page_id: 900_000_000 + i, slug: `pad/page-${i}` }));
+    const unread = await collapseResults(failing, rows.map(r => ({ ...r })), { prefetched: Promise.resolve(null) });
+    expect(row(unread, 'concepts/kestrel-plan-old')?.redirect_to).toBeUndefined();
+    const out = await collapseResults(failing, rows.map(r => ({ ...r })), { prefetched: prefetchPageFacts(engine, [...ahead, ...rows]) });
+    expect(row(out, 'concepts/kestrel-plan-old')?.redirect_to).toBe('kestrel');
   });
 });
