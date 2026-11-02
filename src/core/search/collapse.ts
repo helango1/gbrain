@@ -51,6 +51,8 @@ const ENTITY_TYPES = new Set(['person', 'company', 'organization', 'deal', 'yc',
 const DATED_SOURCES = new Set(['date', 'published', 'filename', 'event_date']);
 /** Pages compared pairwise for families: the head the reranker and the caller read. */
 const FAMILY_HEAD = 40;
+/** Fused pages the prefetch reads body identity for: the family head, with room for boosts and dedup to reorder it. */
+const PREFETCH_BODY_HEAD = FAMILY_HEAD + FAMILY_HEAD / 2;
 /** Identical bodies shorter than this (empty templates, one-line stubs) say nothing about a shared document. */
 const IDENTICAL_BODY_MIN_CHARS = 200;
 const INJECTED_LEAD_CHARS = 1500;
@@ -126,7 +128,8 @@ class Groups {
 
 const STATUS_REDIRECT = `lower(COALESCE(frontmatter->>'status', '')) ~ '(^|[^a-z])(alias|redirect|redirected)([^a-z]|$)'`;
 
-export interface PageFacts { target: string | null; body: string | null; bodyChars: number | null; words: Set<string> | null }
+/** `bodyRead`: `body` and `words` were read (a page outside the read's body ids has neither). */
+export interface PageFacts { target: string | null; body: string | null; bodyChars: number | null; words: Set<string> | null; bodyRead: boolean }
 
 /**
  * Per page id: the frontmatter redirect target, the body's length (bounded prefix: a body under the bound is whole),
@@ -146,22 +149,37 @@ async function readFactRows(engine: Pick<BrainEngine, 'executeRaw'>, ids: number
        FROM pages p WHERE p.id = ANY($1::int[])`,
     [ids, bodyIds],
   );
-  const facts = new Map<number, PageFacts>(ids.map(id => [id, { target: null, body: null, bodyChars: null, words: null }]));
-  for (const r of rows) facts.set(Number(r.id), { target: r.target, body: r.body, bodyChars: r.body_chars === null ? null : Number(r.body_chars), words: wordSet(r.lead) });
+  const read = new Set(bodyIds);
+  const facts = new Map<number, PageFacts>(ids.map(id => [id, { target: null, body: null, bodyChars: null, words: null, bodyRead: read.has(id) }]));
+  for (const r of rows) {
+    const id = Number(r.id);
+    facts.set(id, { target: r.target, body: r.body, bodyChars: r.body_chars === null ? null : Number(r.body_chars), words: wordSet(r.lead), bodyRead: read.has(id) });
+  }
   return facts;
 }
 
 /**
- * GBRA-156: the facts of every page in `ids`, body identity included, read now. Hybrid search starts it for the fused
- * pages beside the post-fusion reads; collapseResults then takes its pages' entries from it (body identity only for
- * the pages it compares, as its own read would) instead of a round trip of its own. Null when the read fails.
+ * GBRA-156: the facts of every page in `rows` (fused order), read now. Hybrid search starts it for the fused pages
+ * beside the post-fusion reads; collapseResults then takes its pages' entries from it (body identity only for the
+ * pages it compares, as its own read would) instead of a round trip of its own. Body identity is read for the first
+ * PREFETCH_BODY_HEAD pages and every page whose slug another source shares, the pages the collapse compares; a
+ * compared page outside them is read by the collapse itself. Null when the read fails.
  */
-export function prefetchPageFacts(engine: Pick<BrainEngine, 'executeRaw'>, ids: number[]): Promise<Map<number, PageFacts> | null> {
-  const valid = [...new Set(ids)].filter(id => Number.isSafeInteger(id) && id > 0);
-  return valid.length ? readFactRows(engine, valid, valid).catch(() => null) : Promise.resolve(null);
+export function prefetchPageFacts(engine: Pick<BrainEngine, 'executeRaw'>, rows: Pick<SearchResult, 'page_id' | 'slug'>[]): Promise<Map<number, PageFacts> | null> {
+  const slugs = new Map<number, string>();
+  for (const r of rows) if (Number.isSafeInteger(r.page_id) && r.page_id > 0 && !slugs.has(r.page_id)) slugs.set(r.page_id, r.slug);
+  if (slugs.size === 0) return Promise.resolve(null);
+  const slugCount = new Map<string, number>();
+  for (const slug of slugs.values()) slugCount.set(slug, (slugCount.get(slug) ?? 0) + 1);
+  const ids = [...slugs.keys()];
+  const bodyIds = ids.filter((id, i) => i < PREFETCH_BODY_HEAD || slugCount.get(slugs.get(id)!)! > 1);
+  return readFactRows(engine, ids, bodyIds).catch(() => null);
 }
 
-/** The facts of `allIds` into `cache` (ids already there are not read again; `prefetched` entries are not read at all). */
+/**
+ * The facts of `allIds` into `cache` (ids already there are not read again; `prefetched` entries are not read at all,
+ * except a `bodyIds` page whose entry lacks body identity).
+ */
 async function readPageFacts(engine: Pick<BrainEngine, 'executeRaw'>, allIds: number[], bodyIds: number[], cache: Map<number, PageFacts>,
   prefetched?: Promise<Map<number, PageFacts> | null>): Promise<Map<number, PageFacts>> {
   const ids = allIds.filter(id => !cache.has(id));
@@ -170,14 +188,19 @@ async function readPageFacts(engine: Pick<BrainEngine, 'executeRaw'>, allIds: nu
   const bodies = new Set(bodyIds);
   for (const id of ids) {
     const known = early?.get(id);
-    if (known) cache.set(id, bodies.has(id) ? known : { ...known, body: null, words: null });
+    if (known && (known.bodyRead || !bodies.has(id))) cache.set(id, bodies.has(id) ? known : { ...known, body: null, words: null, bodyRead: false });
   }
   const unread = ids.filter(id => !cache.has(id));
   if (unread.length === 0) return cache;
   try {
     for (const [id, facts] of await readFactRows(engine, unread, bodyIds)) cache.set(id, facts);
   } catch {
-    // fail-open: no frontmatter redirects or body identity this call
+    // fail-open: no frontmatter redirects or body identity this call, beyond what the prefetch read (those entries
+    // stay in the cache for the rest of the request)
+    for (const id of unread) {
+      const known = early?.get(id);
+      if (known) cache.set(id, known);
+    }
   }
   return cache;
 }

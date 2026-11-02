@@ -180,7 +180,7 @@ export async function fuseArms(
   // both, or neither fires depending on resolved modes.
   if (fused.length > 0) await req.timer.stage('post_fusion', async () => {
     const generatedRead = readGeneratedPages(engine, fused);
-    if (resolvedMode.collapse) req.collapsePrefetch = prefetchPageFacts(engine, fused.map(r => r.page_id));
+    if (resolvedMode.collapse) req.collapsePrefetch = prefetchPageFacts(engine, fused);
     await runPostFusionStages(engine, fused, {
       ...postFusionOpts, skipMetadataBoosts: !metadataBoostGate.boosts_applied,
     });
