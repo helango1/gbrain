@@ -10,6 +10,19 @@ credits are retained; no result has been reassigned to another provider. Origina
 identifiers and attribution are available in the pre-removal Git revision
 `6040075c6cb95be5881cc2e1b76ef7d71f4e5d29` (retained on 2026-09-23).
 
+## [0.60.498.0] - 2026-11-03
+
+**Warm hybrid search re-scores faster: the cosine re-score parses the query vector once per statement, not once per row.**
+
+The cosine re-score (`cosineByChunkIdsStatement`) bound the query vector as text and cast it with `$N::text::vector` inside the per-row expression. After five executions the server switches to a generic plan, and the generic plan parsed the 1536-dim literal again for every hydrated row. The cast now runs in a `(SELECT $N::text::vector)` InitPlan, so the literal is parsed once per statement. The parameter stays bound as text, a built-in type, so a transaction pooler still shares its described types. Results, ranking, filters, schema and limits are unchanged.
+
+On a synthetic brain (warm `gbrain serve`, interleaved A/B, 6 rounds, N=60 per round), warm search p50 went from 82.7 to 69.0 ms on Postgres and from 338.6 to 104.5 ms on PGLite; p95 went from 107.5 to 86.7 ms and from 516.0 to 164.4 ms. Result ids, order and scores were identical on every call.
+
+### Itemized changes
+
+- `src/core/engine-sql/chunks.ts`: `cosineByChunkIdsStatement` casts the query vector in a `(SELECT ...)` InitPlan.
+- `test/cosine-rescore-column.test.ts`: pins the InitPlan in the statement plan and the scores of every hydrated chunk.
+
 ## [0.60.495.0] - 2026-10-29
 
 **Every harness install now tells the agent to check gbrain first, and the rule rides each turn, not just the system prompt.**

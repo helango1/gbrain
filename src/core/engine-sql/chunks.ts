@@ -1089,14 +1089,18 @@ export async function getEmbeddingsByChunkIds(exec: LegacyUnscopedRead, ids: num
  * visibility). A hydrated vector whose dimensions differ from the query's,
  * or a zero-norm vector or query, scores 0 without reaching the operator, as
  * `cosineSimilarity` does; an absent or invisible chunk returns no row.
+ * The query stays bound as text (a built-in type, so a transaction pooler
+ * shares its described types; GBRA-156) and is cast in a `(SELECT ...)`
+ * InitPlan, so a generic plan parses the 1536-dim literal once per
+ * statement, not once per row.
  */
 export function cosineByChunkIdsStatement(ids: number[], column: string, query: Float32Array): { text: string; params: unknown[] } {
   if (!COLUMN_NAME_REGEX.test(column)) throw new EmbeddingColumnNotRegisteredError(column, []);
   const col = trustedSql(`cc.${quoteIdentifier(column)}`);
   const q = `[${Array.from(query).join(',')}]`;
   return renderFragment(sqlFragment`
-    SELECT cc.id, CASE WHEN vector_dims(${col}::vector) <> ${query.length}::int OR vector_norm(${col}::vector) = 0 OR vector_norm(${q}::text::vector) = 0
-                       THEN 0::float8 ELSE 1 - (${col}::vector <=> ${q}::text::vector) END AS cosine
+    SELECT cc.id, CASE WHEN vector_dims(${col}::vector) <> ${query.length}::int OR vector_norm(${col}::vector) = 0 OR vector_norm((SELECT ${q}::text::vector)) = 0
+                       THEN 0::float8 ELSE 1 - (${col}::vector <=> (SELECT ${q}::text::vector)) END AS cosine
       FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
      WHERE cc.id = ANY(${ids}::int[]) AND ${col} IS NOT NULL AND ${trustedSql(chunkVisibleFilter('p', 'cc'))}
   `);

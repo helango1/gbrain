@@ -21,6 +21,7 @@ import {
   EmbeddingColumnNotRegisteredError,
 } from '../src/core/search/embedding-column.ts';
 import { configureGateway, resetGateway } from '../src/core/ai/gateway.ts';
+import { cosineByChunkIdsStatement } from '../src/core/engine-sql/chunks.ts';
 import type { PageInput, ChunkInput } from '../src/core/types.ts';
 
 let engine: PGLiteEngine;
@@ -136,5 +137,23 @@ describe('getEmbeddingsByChunkIds — column parameter (D9)', () => {
   test('empty id list short-circuits (no SQL run)', async () => {
     const map = await engine.getEmbeddingsByChunkIds([], 'embedding_voyage');
     expect(map.size).toBe(0);
+  });
+});
+
+describe('cosineByChunkIdsStatement — query vector parsed once', () => {
+  const query = new Float32Array(1536).fill(0.003);
+
+  test('the query cast runs in an InitPlan, not once per hydrated row', async () => {
+    const { text, params } = cosineByChunkIdsStatement([chunkId, chunkId2], 'embedding', query);
+    const plan = await engine.executeRaw<{ 'QUERY PLAN': string }>(`EXPLAIN ${text}`, params);
+    expect(plan.map(r => r['QUERY PLAN']).join('\n')).toContain('InitPlan');
+  });
+
+  test('scores stay correct for every hydrated chunk', async () => {
+    const { text, params } = cosineByChunkIdsStatement([chunkId, chunkId2], 'embedding', query);
+    const rows = await engine.executeRaw<{ id: number; cosine: number }>(text, params);
+    expect(rows.map(r => r.id).sort((a, b) => a - b)).toEqual([chunkId, chunkId2].sort((a, b) => a - b));
+    // Parallel constant vectors: cosine 1 for both chunks (float4 rounding).
+    for (const r of rows) expect(Number(r.cosine)).toBeCloseTo(1, 4);
   });
 });
