@@ -13,6 +13,9 @@
  * cosine values equal the JavaScript cosine of the stored vectors. The plan
  * (HNSW index kept) is pinned by test/e2e/vector-plan-real-column-postgres.test.ts.
  * Regression that fails it on the base branch: every run describes first.
+ * Mutation check: casting the query as \`$1::vector\` in buildVectorCastFragment
+ * (ANN) or in cosineByChunkIdsStatement (re-score) fails it; the in-test
+ * control runs that statement-only form and asserts a describe per run.
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -72,6 +75,13 @@ run('vector statements skip the describe round trip', () => {
           const cosines = (await engine.executeRaw<{ id: number; cosine: number }>(text, params)).map(r => ({ id: Number(r.id), cosine: Number(r.cosine) })).sort((a, b) => a.id - b.id);
           results.push({ hits, cosines });
         }
+        // Control: the statement-only form (`$N::vector`, an extension-type
+        // parameter) describes on every run, so the trace below can see the
+        // regression this guard exists to catch.
+        const { text, params } = cosineByChunkIdsStatement(ids, 'embedding', query);
+        const control = text.replaceAll('::text::vector', '::vector');
+        expect(control).not.toBe(text);
+        for (let i = 0; i < 2; i++) await engine.executeRaw(control, params);
       } finally {
         await engine.disconnect();
       }
@@ -80,7 +90,8 @@ run('vector statements skip the describe round trip', () => {
     const records = readSqlTrace(trace).filter(r => r.kind === 'describe' || r.kind === 'execute');
     const kinds = (match: (sql: string) => boolean) => records.filter(r => match(r.sql)).map(r => r.kind);
     const annTexts = [...new Set(records.filter(r => r.sql.includes('<=> $1::')).map(r => r.sql))];
-    const cosine = kinds(sql => sql.includes('vector_norm('));
+    const cosine = kinds(sql => sql.includes('vector_norm(') && sql.includes('::text::vector'));
+    const control = kinds(sql => sql.includes('vector_norm(') && !sql.includes('::text::vector'));
 
     expect(results[0]!.hits.length).toBeGreaterThan(0);
     expect(results[1]).toEqual(results[0]!);
@@ -89,5 +100,6 @@ run('vector statements skip the describe round trip', () => {
     expect(annTexts.length).toBeGreaterThan(0);
     for (const text of annTexts) expect(kinds(sql => sql === text)).toEqual(['describe', 'execute', 'execute']);
     expect(cosine).toEqual(['describe', 'execute', 'execute']);
+    expect(control).toEqual(['describe', 'execute', 'describe', 'execute']);
   }, 120_000);
 });
